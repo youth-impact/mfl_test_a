@@ -6,14 +6,14 @@ library('googledrive')
 library('googlesheets4')
 library('yaml')
 
-paramsDir = 'params'
-params = read_yaml(file.path(paramsDir, 'params.yaml'))
+# yaml file used by [update_views()]
+params = read_yaml(file.path('params', 'params.yaml'))
 
 ########################################
 
-if (Sys.getenv('GOOGLE_TOKEN') == '') {
+if (Sys.getenv('GOOGLE_TOKEN') == '') { # not on GitHub
   drive_auth(email = 'youthimpactautomation@gmail.com')
-} else {
+} else { # on GitHub Actions runner
   drive_auth(path = Sys.getenv('GOOGLE_TOKEN'))
 }
 
@@ -21,6 +21,15 @@ gs4_auth(token = drive_token())
 
 ########################################
 
+#' Convert list columns to character columns
+#'
+#' This function is useful for dealing with data.tables derived from Google
+#' Sheets, and takes care to convert `NULL` values in a list to `NA` in the
+#' resulting character vector.
+#'
+#' @param d A `data.table`.
+#'
+#' @return A `data.table`.
 fix_list_cols = function(d) {
   assert_data_table(d)
   d = copy(d)
@@ -33,7 +42,19 @@ fix_list_cols = function(d) {
   d[]
 }
 
-
+#' Standardize date formats in a data.table
+#'
+#' This function deals with the cornucopia of date formats coming from
+#' SurveyCTO via Google Sheets, where a given column in a `data.table` could
+#' have values in multiple different formats.
+#'
+#' @param d A `data.table`.
+#' @param date_colnames A character vector of column names in `d` that contain
+#'   dates.
+#' @param preferred_date_format A string, see [strptime()].
+#'
+#' @return A `data.table` in which the given columns have been converted to
+#'   class `IDate` using [data.table::as.IDate()].
 fix_dates = function(d, date_colnames, preferred_date_format) {
   if (is.null(date_colnames)) return(d)
   assert_data_table(d)
@@ -67,7 +88,17 @@ fix_dates = function(d, date_colnames, preferred_date_format) {
   d[]
 }
 
-
+#' Read multiple worksheets from a Google Sheet
+#'
+#' @param file_id A `drive_id` corresponding to a Google Sheet.
+#' @param date_colnames A character vector of column names in the `data`
+#'   worksheet that contains dates.
+#' @param preferred_date_format A string, see [strptime()].
+#' @param sheets A character vector of names of worksheets in the Google Sheet
+#'   to be read in as `data.table`s.
+#'
+#' @return A named list of `data.table`s derived from
+#'   [googlesheets4::read_sheet()].
 get_tables = function(
     file_id, preferred_date_format = NULL,
     sheets = c(
@@ -81,16 +112,21 @@ get_tables = function(
   names(tables) = sheets
 
   if (nrow(tables$show_columns) > 0) {
+    # if no column label specified, just use the column name
     tables$show_columns[is.na(column_label), column_label := column_name]
   }
+  # omit rows with missing values, which typically correspond to group headers
   tables$viewers = unique(na.omit(tables$viewers))
 
+  # using this table before checking its validity
   if ('column_name' %in% colnames(tables$date_columns)) {
     tables$date_columns[, column_name := as.character(column_name)]
   }
 
   if (nrow(tables$data) > 0) {
+    # omit rows lacking an id, typically for former facilitators
     tables$data = tables$data[!is.na(id)]
+    # deal with messy dates
     tables$data = fix_list_cols(tables$data)
     tables$data = fix_dates(
       tables$data, tables$date_columns$column_name, preferred_date_format)
@@ -98,7 +134,14 @@ get_tables = function(
   tables
 }
 
-
+#' Check for equality between data.tables within two lists
+#'
+#' This function makes deliberate use of [data.table::all.equal()].
+#'
+#' @param x A list of `data.tables`.
+#' @param y A list of `data.tables`.
+#'
+#' @return A named logical vector.
 compare_tables = function(x, y) {
   assert_list(x, types = 'data.table', any.missing = FALSE)
   assert_list(y, types = 'data.table', any.missing = FALSE)
@@ -121,24 +164,42 @@ compare_tables = function(x, y) {
   eq
 }
 
-
+#' Determine whether the groups table is valid
+#'
+#' @param groups A `data.table` from the `groups` worksheet of the main Google
+#'   Sheet.
+#'
+#' @return 0 if valid, a string otherwise.
 get_validity_groups = function(groups) {
   ans = if (!identical(colnames(groups), c('group_id', 'file_url'))) {
     'Column names of the `groups` sheet are not "group_id" and "file_url".'
   } else if (any(apply(groups, 2, uniqueN) != nrow(groups))) {
     'At least one column of the `groups` sheet contains duplicated values.'
-  } else if (!identical(
-    as_id(groups$file_url), drive_get(groups$file_url)$id)) {
-    # might just throw an error
-    paste('At least one row of the `file_url` column of the `groups`',
-          'sheet does not correspond to a valid spreadsheet file.')
+  # } else if (!all(RCurl::url.exists(groups$file_url))) {
+  #   paste('At least one row of the `file_url` column of the `groups`',
+  #         'sheet does not correspond to a valid URL.')
   } else {
-    0
+    ans_tmp = tryCatch(
+      anyNA(sapply(groups$file_url, as_sheets_id)), error = \(e) e)
+    if (inherits(ans_tmp, 'error') || isTRUE(ans_tmp)) {
+      paste('At least one row of the `file_url` column of the `groups`',
+            'sheet does not correspond to a valid spreadsheet file.')
+    } else {
+      0
+    }
   }
   ans
 }
 
-
+#' Determine whether the show_columns table is valid
+#'
+#' @param show_columns A `data.table` from the `show_columns` worksheet of the
+#'   main Google Sheet.
+#' @param group_ids A vector of group ids.
+#' @param data_cols A vector of columns in the `data` table in the main Google
+#'   Sheet.
+#'
+#' @return 0 if valid, a string otherwise.
 get_validity_show_columns = function(show_columns, group_ids, data_cols) {
   ans = if (!identical(
     colnames(show_columns)[1:2], c('column_name', 'column_label'))) {
@@ -149,7 +210,7 @@ get_validity_show_columns = function(show_columns, group_ids, data_cols) {
           'sheet contains duplicated values.')
   } else if (!all(show_columns$column_name %in% data_cols)) {
     paste('The `column_name` column of the `show_columns` sheet contains',
-         'values not present in the column names of the dataset.')
+          'values not present in the column names of the dataset.')
   } else if (anyDuplicated(show_columns$column_label) != 0) {
     paste('The `column_label` column of the `show_columns`',
           'sheet contains duplicated values.')
@@ -168,7 +229,15 @@ get_validity_show_columns = function(show_columns, group_ids, data_cols) {
   ans
 }
 
-
+#' Determine whether the hide_rows table is valid
+#'
+#' @param hide_rows A `data.table` from the `hide_rows` worksheet of the
+#'   main Google Sheet.
+#' @param group_ids A vector of group ids.
+#' @param dataset A `data.table` from the `data` worksheet of the main Google
+#'   Sheet.
+#'
+#' @return 0 if valid, a string otherwise.
 get_validity_hide_rows = function(hide_rows, group_ids, dataset) {
   cols = c('column_name', 'column_value')
   ans = if (!identical(colnames(hide_rows)[1:2], cols)) {
@@ -208,7 +277,13 @@ get_validity_hide_rows = function(hide_rows, group_ids, dataset) {
   ans
 }
 
-
+#' Determine whether the viewers table is valid
+#'
+#' @param viewers A `data.table` from the `viewers` worksheet of the
+#'   main Google Sheet.
+#' @param group_ids A vector of group ids.
+#'
+#' @return 0 if valid, a string otherwise.
 get_validity_viewers = function(viewers, group_ids) {
   ans = if (!setequal(
     colnames(viewers), c('viewer_name', 'viewer_email', 'group_id'))) {
@@ -223,7 +298,13 @@ get_validity_viewers = function(viewers, group_ids) {
   ans
 }
 
-
+#' Determine whether the sorting table is valid
+#'
+#' @param sorting A `data.table` from the `sorting` worksheet of the main Google
+#'   Sheet.
+#' @param group_ids A vector of group ids.
+#'
+#' @return 0 if valid, a string otherwise.
 get_validity_sorting = function(sorting, dataset) {
   assert_data_table(sorting)
   assert_data_table(dataset)
@@ -234,7 +315,7 @@ get_validity_sorting = function(sorting, dataset) {
           '"column_name" and "column_value".')
   } else if (!all(sorting$column_name %in% colnames(dataset))) {
     paste('The `column_name` column of the `sorting` sheet contains',
-         'values that are not column names of the dataset.')
+          'values that are not column names of the dataset.')
   } else {
     special = c('*ascending*', '*descending*')
     n = table(sorting[column_value %in% special]$column_name)
@@ -248,11 +329,11 @@ get_validity_sorting = function(sorting, dataset) {
 
     if (any(n > 1)) {
       paste('In the `sorting` sheet, "*ascending*" or "*descending*"',
-            'is not the only `column_value` for a given `column_name`.')
-    } else if (
-      nrow(sort_plain) > 0 && nrow(fsetdiff(sort_plain, data_plain)) > 0) {
-      paste('The `sorting` sheet contains combinations of `column_name`',
-           'and `column_value` not present in the dataset.')
+            'occurs more than once for a given `column_name`.')
+    # } else if (
+    #   nrow(sort_plain) > 0 && nrow(fsetdiff(sort_plain, data_plain)) > 0) {
+    #   paste('The `sorting` sheet contains combinations of `column_name`',
+    #         'and `column_value` not present in the dataset.')
     } else {
       0
     }
@@ -260,19 +341,30 @@ get_validity_sorting = function(sorting, dataset) {
   ans
 }
 
-
+#' Determine whether the date_columns table is valid
+#'
+#' @param sorting A `data.table` from the `date_columns` worksheet of the main
+#'   Google Sheet.
+#'
+#' @return 0 if valid, a string otherwise.
 get_validity_date_columns = function(date_columns) {
   assert_data_table(date_columns)
   ans = if (!setequal(colnames(date_columns), 'column_name')) {
-    paste('The `date_columns` sheet does not only',
-          'have one column, named "column_name".')
+    paste('The `date_columns` sheet does not have',
+          'only one column, named "column_name".')
   } else {
     0
   }
   ans
 }
 
-
+#' Determine whether the tables from a Google Sheet are valid
+#'
+#' This function individually checks the validity of multiple tables.
+#'
+#' @param x A named list of `data.table`s.
+#'
+#' @return 0 if valid, a string otherwise.
 get_validity_tables = function(x) {
   assert_list(x, types = 'data.table', any.missing = FALSE)
 
@@ -298,6 +390,13 @@ get_validity_tables = function(x) {
 
 ########################################
 
+#' Get current share permissions for a Drive file
+#'
+#' This function extracts relevant information using [googledrive::drive_get()].
+#'
+#' @param file_id A `drive_id` corresponding to a Drive file.
+#'
+#' @return A `data.table`.
 drive_share_get = function(file_id) {
   assert_class(file_id, 'drive_id')
   perms = drive_get(file_id)$drive_resource[[1L]]$permissions
@@ -307,7 +406,15 @@ drive_share_get = function(file_id) {
     role = sapply(perms, `[[`, 'role'))
 }
 
-
+#' Add share permissions to a Drive file
+#'
+#' This function uses [googledrive::drive_share()] to grant access.
+#'
+#' @param file_id A `drive_id` corresponding to a Drive file.
+#' @param emails A character vector of email addresses.
+#' @param role The role to give the email addresses.
+#'
+#' @return 0 if no errors encountered, 1 otherwise, invisibly.
 drive_share_add = function(file_id, emails, role = 'reader') {
   assert_class(file_id, 'drive_id')
   assert_character(emails, any.missing = FALSE)
@@ -328,7 +435,14 @@ drive_share_add = function(file_id, emails, role = 'reader') {
   invisible(ans)
 }
 
-
+#' Remove share permissions from a Drive file
+#'
+#' This function uses [googledrive::request_make()] to send a DELETE request.
+#'
+#' @param file_id A `drive_id` corresponding to a Drive file.
+#' @param user_ids A vector of user ids for which to revoke access.
+#'
+#' @return A `dribble` for the Drive file, invisibly.
 drive_share_remove = function(file_id, user_ids) {
   assert_class(file_id, 'drive_id')
   gfile = drive_get(file_id)
@@ -347,6 +461,15 @@ drive_share_remove = function(file_id, user_ids) {
 
 ########################################
 
+#' Get background colors of a range in a Google Sheet
+#'
+#' @param file_id A `drive_id` corresponding to a Drive file.
+#' @param sheet Passed to [googlesheets4::range_read_cells()].
+#' @param range Passed to [googlesheets4::range_read_cells()].
+#' @param nonwhite Logical indicating whether to only include cells having
+#'   non-white background colors.
+#'
+#' @return A `data.table` having one row per cell.
 drive_get_background = function(file_id, sheet, range, nonwhite = TRUE) {
   assert_class(file_id, 'drive_id')
   assert_string(sheet)
@@ -354,6 +477,7 @@ drive_get_background = function(file_id, sheet, range, nonwhite = TRUE) {
 
   bg = setDT(range_read_cells(file_id, sheet, range, cell_data = 'full'))
   for (color in c('red', 'green', 'blue')) {
+    # sometimes one of the RGB values is missing
     value = lapply(bg$cell, \(z) z$effectiveFormat$backgroundColor[[color]]) |>
       sapply(\(z) if (is.null(z)) 0 else z)
     set(bg, j = color, value = value)
@@ -363,7 +487,16 @@ drive_get_background = function(file_id, sheet, range, nonwhite = TRUE) {
   bg
 }
 
-
+#' Set background colors in columns of a Google Sheet
+#'
+#' This function constructs a JSON string, then makes and sends a Google Sheets
+#' API request.
+#'
+#' @param file_id A `drive_id` corresponding to a Drive file.
+#' @param background A `data.table` having columns `start_col`, `red`, `green`,
+#'   and `blue`.
+#'
+#' @return The result of [googlesheets4::request_make()], invisibly.
 drive_set_background = function(file_id, background) {
   assert_class(file_id, 'drive_id')
   assert_data_table(background)
@@ -404,19 +537,39 @@ drive_set_background = function(file_id, background) {
 
 ########################################
 
+#' Sort rows of a dataset according to a sorting table
+#'
+#' @param dataset A `data.table`.
+#' @param sorting A `data.table` derived from the `sorting` worksheet of the
+#'   Google Sheet.
+#'
+#' @return The `dataset`, now sorted.
 sort_dataset = function(dataset, sorting) {
   assert_data_table(dataset)
   assert_data_table(sorting)
   dataset = copy(dataset)
 
+  # for specified sorting orders, create factors
   special = c('*ascending*', '*descending*')
   cols_tmp = unique(sorting[!(column_value %in% special)]$column_name)
   for (col in cols_tmp) {
     levs_tmp = sorting[column_name == col]$column_value
-    levs = c(levs_tmp, setdiff(unique(dataset[[col]]), levs_tmp))
+    n = length(levs_tmp)
+    levs_main = sort(
+      setdiff(unique(dataset[[col]]), levs_tmp),
+      decreasing = '*descending*' %in% levs_tmp)
+    idx = which(levs_tmp %in% special)
+    levs = if (length(idx) > 0L) {
+      levs_before = if (idx == 1L) NULL else levs_tmp[1:(idx - 1)]
+      levs_after = if (idx == n) NULL else levs_tmp[(idx + 1):n]
+      c(levs_before, levs_main, levs_after)
+    } else {
+      c(levs_tmp, setdiff(unique(dataset[[col]]), levs_tmp))
+    }
     dataset[, y := factor(y, levs), env = list(y = col)]
   }
 
+  # otherwise use ascending or descending
   ordering = sorting[, .(
     ord = 1 - 2 * any(column_value == '*descending*')),
     by = column_name]
@@ -424,13 +577,26 @@ sort_dataset = function(dataset, sorting) {
   dataset
 }
 
-
+#' Get the prefix for the names of the views Google Sheets
+#'
+#' The prefix is based on the name of the main Google Sheet.
+#'
+#' @param file_id A `drive_id` corresponding to a Drive file.
+#'
+#' @return A string.
 get_view_prefix = function(file_id) {
   gfile = drive_get(file_id)$name
   gsub('main$', 'view', gfile)
 }
 
-
+#' Filter rows of a dataset based on the hide_rows table
+#'
+#' @param dataset A `data.table`.
+#' @param hide_rows A `data.table` derived from the `hide_rows` worksheet of
+#'   the Google Sheet.
+#' @param group_id The column in `hide_rows` based on which to filter rows.
+#'
+#' @return The `dataset`, now with some rows possibly removed.
 get_filtered_dataset = function(dataset, hide_rows, group_id) {
   dataset_new = copy(dataset)
   for (i in seq_len(nrow(hide_rows))) {
@@ -443,12 +609,19 @@ get_filtered_dataset = function(dataset, hide_rows, group_id) {
   dataset_new
 }
 
-
-set_views = function(x, bg, prefix, sheet_name) {
+#' Set the views Google Sheets
+#'
+#' @param x A named list of `data.table`s.
+#' @param bg A `data.table` of background colors
+#' @param prefix A string indicating the prefix for the file names.
+#' @param sheet A string indicating the worksheet name in the Google Sheet.
+#'
+#' @return 0 if no errors encountered in [drive_share_add()], 1 otherwise.
+set_views = function(x, bg, prefix, sheet) {
   assert_list(x, types = 'data.table', any.missing = FALSE)
   assert_data_table(bg)
   assert_string(prefix)
-  assert_string(sheet_name)
+  assert_string(sheet)
 
   dataset = sort_dataset(x$data, x$sorting)
   bg = copy(bg)[, column_name := x$show_columns$column_name[row - 1L]]
@@ -467,8 +640,8 @@ set_views = function(x, bg, prefix, sheet_name) {
     dataset_now = dataset_now[, ..cols_now]
     setnames(dataset_now, cols_now, x$show_columns$column_label[idx])
 
-    write_sheet(dataset_now, file_id, sheet = sheet_name)
-    range_autofit(file_id, sheet = sheet_name)
+    write_sheet(dataset_now, file_id, sheet = sheet)
+    range_autofit(file_id, sheet = sheet)
 
     # update formatting
     bg_now = bg[column_name %in% cols_now]
@@ -491,6 +664,13 @@ set_views = function(x, bg, prefix, sheet_name) {
 
 ########################################
 
+#' Update the Google Sheets comprising the facilitator database
+#'
+#' This is the main function called in GitHub Actions.
+#'
+#' @param params A named list of parameters.
+#'
+#' @return A string indicating success or failure.
 update_views = function(params) {
   assert_list(params)
 
@@ -547,7 +727,19 @@ update_views = function(params) {
   msg
 }
 
-
+#' Send environmental variables to a file for GitHub Actions
+#'
+#' @param msg A string containing a message to be assigned to `MESSAGE`.
+#' @param file_url A string indicating the URL of a Google Sheet, to be assigned
+#'   to `FILE_URL`.
+#' @param sheet A string indicating a worksheet in the Google Sheet.
+#' @param colname A string indicating the column name that contains email
+#'   addresses in the given worksheet of the Google Sheet, which will all be
+#'   written to `EMAIL_TO`.
+#' @param env A string indicating the environmental variable pointing to the
+#'   file to which to write the environmental variables.
+#'
+#' @return A `glue` string, invisibly.
 get_env_output = function(
     msg, file_url, sheet = 'maintainers', colname = 'email',
     env = 'GITHUB_ENV') {
